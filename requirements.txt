@@ -1,0 +1,7 @@
+langchain
+openai
+temporalio
+streamlit
+requests
+pandas
+google-api-python-client
