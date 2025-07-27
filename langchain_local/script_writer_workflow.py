@@ -1,24 +1,29 @@
 """
 script_writer_workflow.py
 
-Generate detailed, execution-ready short-form dog reel scripts from idea inputs,
-then rank them via heuristic quality scoring.
+Purpose:
+--------
+Generate detailed, production-ready short-form dog reel scripts (3–6 shots each)
+from raw social media ideas, validate the outputs, optionally repair them, and
+rank the final scripts using heuristic scoring (shot quality, hooks, editing cues, etc.).
 
-Features:
-- Accept raw string or structured dict ideas.
-- Long-context capable Chat model (OpenAI).
-- Parallel generation with retries & exponential backoff.
-- JSON schema style validation & optional repair reprompt.
-- Heuristic ranking & leaderboard output.
-- CLI demonstration.
+Key Features:
+-------------
+- Accepts raw string or structured JSON ideas as input.
+- Uses OpenAI Chat model (via LangChain) for long-context script generation.
+- Parallelized script generation with retries and exponential backoff.
+- Schema validation and repair prompts for malformed or incomplete JSON.
+- Heuristic scoring and ranking of final scripts (leaderboard format).
+- CLI demonstration for local testing.
 
-Set ENV:
-  OPENAI_API_KEY
+Required ENV:
+    OPENAI_API_KEY
+
 Optional ENV:
-  SCRIPT_MODEL_NAME (default gpt-4o)
-  SCRIPT_MAX_WORKERS (default 6)
+    SCRIPT_MODEL_NAME   (default: gpt-4o)
+    SCRIPT_MAX_WORKERS  (default: 6)
 
-Author: (Your project)
+Author: (Your Project)
 """
 
 from __future__ import annotations
@@ -28,39 +33,51 @@ import math
 import json
 import uuid
 import re
-from dataclasses import dataclass, asdict
+import dotenv
+from dataclasses import dataclass
 from typing import List, Dict, Any, Iterable, Callable, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ========== LLM Import ==========
+# ==================================================
+# LLM Setup (LangChain with OpenAI backend)
+# ==================================================
 try:
     from langchain_openai import ChatOpenAI
 except ImportError:
-    from langchain.chat_models import ChatOpenAI  # fallback
+    # Fallback for older LangChain installs
+    from langchain.chat_models import ChatOpenAI  # type: ignore
 
 from langchain.schema import HumanMessage, SystemMessage
 
-# ========== Configuration ==========
+# ==================================================
+# Configuration (model, retries, and safety)
+# ==================================================
+
+#load from dotenv file
+dotenv.load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("SCRIPT_MODEL_NAME", "gpt-4o")
 MAX_WORKERS = int(os.getenv("SCRIPT_MAX_WORKERS", "6"))
 TEMPERATURE = 0.65
-MAX_MODEL_TOKENS = 900
-RETRY_ATTEMPTS = 4
-BASE_BACKOFF = 2.0
-REPAIR_ATTEMPTS = 1            # number of repair re-prompts if validation fails
-QUALITY_DEBUG = False          # set True to print scoring internals per idea
+MAX_MODEL_TOKENS = 900               # Token limit per generation
+RETRY_ATTEMPTS = 4                   # Attempts for primary generation
+BASE_BACKOFF = 2.0                   # Exponential backoff base (2, 4, 8s...)
+REPAIR_ATTEMPTS = 1                  # Secondary repair passes (if validation fails)
+QUALITY_DEBUG = False                # Debug scoring breakdowns
 
 if not OPENAI_API_KEY:
     raise EnvironmentError("OPENAI_API_KEY not set.")
 
-# ========== System & Prompt Templates ==========
-
+# ==================================================
+# Prompt Templates (System + User Messages)
+# ==================================================
 SCRIPT_SYSTEM = (
     "You are a senior short-form video director for high-retention pet Reels/TikToks. "
     "You output ONLY valid JSON meeting the requested schema."
 )
 
+# Schema description (ensures consistent structure)
 SCHEMA_BLOCK = """
 Required JSON object keys:
 idea_id (string),
@@ -82,6 +99,7 @@ rationale (<=180 chars),
 generated_at (ISO8601)
 """
 
+# Full user-facing instruction prompt (merged with dog profile & idea)
 SCRIPT_USER_TEMPLATE = """Dog Profile:
 {dog_profile}
 
@@ -89,31 +107,40 @@ Original Idea (JSON or text):
 {idea_json}
 
 TASK:
-Transform the idea into an execution-ready script (do not simply restate the idea).
-Elevate specificity: pacing, camera, anticipation, pattern interrupts, editing direction.
+Transform the idea into a fully execution-ready script (not just a paraphrase).
+Include specific pacing, camera moves, anticipation beats, pattern interrupts,
+and editing cues for professional-style Reels/TikToks.
 
 OUTPUT RULES:
-Return ONLY one JSON object with schema (see below). No markdown, no commentary.
+Return ONLY one JSON object using this schema. No markdown, no commentary.
 {schema_block}
 
 Constraints:
-- 3–6 primary shots (condense if verbose).
-- Hook spoken & on_screen may differ for contrast; spoken <12 words.
-- Provide durations in seconds (approx; float acceptable).
-- Each action must be concrete (avoid generic 'dog does something').
-- Include at least one anticipation/suspense or payoff moment.
-- Provide at least one pattern interrupt (zoom, b-roll insert, jump cut, etc.).
-- hashtags: 6–10, mix broad (#dogsoftiktok), breed (#germanshepherd), locale (#seattledog), trend/meme.
-- Avoid emojis; no trailing period on hashtags.
+- 3–6 primary shots (condense verbose sections as needed).
+- Spoken hook <12 words; can differ from on-screen hook for contrast.
+- Each action must be specific (avoid vague "dog does something").
+- Include at least one anticipation or suspense payoff moment.
+- Include at least one pattern interrupt (zoom, b-roll, jump cut, speed change, etc.).
+- Hashtags: 6–10 (mix general, breed, locale, and trending).
+- Avoid emojis; no trailing periods on hashtags.
 - rationale <=180 chars.
-- editing_notes should reference at least 1 editing technique (cut/zoom/speed/color/sound design).
-- JSON must be strictly valid; no trailing commas; keys spelled exactly as required.
+- editing_notes must reference at least 1 specific editing technique (cut, zoom, color, etc.).
+- JSON must be strictly valid (no trailing commas, all required keys).
 """
 
-# ========== Data Structures ==========
-
+# ==================================================
+# Data Structure for Script Results
+# ==================================================
 @dataclass
 class ScriptResult:
+    """
+    Captures the full outcome of a single script generation attempt:
+      - References to input idea and type.
+      - Script JSON (if successful).
+      - Raw LLM text output (for debugging/repair).
+      - Errors, latency, attempts, and whether a repair prompt was used.
+      - Final quality score, score components, and any validation warnings.
+    """
     idea_ref: str
     idea_source_type: str
     script_json: Dict[str, Any] | None
@@ -127,28 +154,38 @@ class ScriptResult:
     score_components: Dict[str, float] | None = None
     warnings: List[str] | None = None
 
-# ========== LLM Instance ==========
+# ==================================================
+# LLM Instance (Global)
+# ==================================================
 llm = ChatOpenAI(
     model_name=MODEL_NAME,
     temperature=TEMPERATURE,
     max_tokens=MAX_MODEL_TOKENS
 )
 
-# ========== Helpers ==========
-
+# ==================================================
+# Utility Functions
+# ==================================================
 def estimate_tokens(text: str) -> int:
+    """Estimate token count (heuristic: ~4 characters per token)."""
     return math.ceil(len(text) / 4)
 
 def truncate(text: str, max_tokens: int, margin: int = 200) -> str:
+    """
+    Truncate text if token estimate (plus margin) exceeds limit.
+    Prevents exceeding context window for long ideas.
+    """
     if estimate_tokens(text) + margin <= max_tokens:
         return text
     target_chars = (max_tokens - margin) * 4
     return text[:target_chars] + "... [TRIMMED]"
 
 def iso_now() -> str:
+    """Return current UTC time in ISO8601 format."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 def safe_get(d: Dict[str, Any], path: str, default=None):
+    """Safely retrieve nested dict values using dotted paths."""
     cur = d
     for part in path.split('.'):
         if not isinstance(cur, dict) or part not in cur:
@@ -156,13 +193,25 @@ def safe_get(d: Dict[str, Any], path: str, default=None):
         cur = cur[part]
     return cur
 
-# ========== Prompt Builder ==========
-
+# ==================================================
+# Prompt Builder (Combines System & User Messages)
+# ==================================================
 def build_script_prompt(idea: Union[str, Dict[str, Any]], dog_profile: str) -> Tuple[List[Any], str]:
+    """
+    Construct a structured LangChain prompt for the LLM based on:
+      - The original idea (string or dict).
+      - The dog's profile (traits, locale, quirks).
+
+    Returns:
+        - List of LangChain messages (System + Human).
+        - Reference string for the idea (for result tracking).
+    """
     if isinstance(idea, dict):
+        # Only include essential fields for context (avoid clutter)
         compact_keys = {
-            "idea_id","hook","core_concept","trend_leverage",
-            "shot_list","on_screen_text","audio_suggestion","caption","hashtags"
+            "idea_id", "hook", "core_concept", "trend_leverage",
+            "shot_list", "on_screen_text", "audio_suggestion",
+            "caption", "hashtags"
         }
         compact = {k: idea[k] for k in idea if k in compact_keys}
         if "idea_id" not in compact:
@@ -171,24 +220,25 @@ def build_script_prompt(idea: Union[str, Dict[str, Any]], dog_profile: str) -> T
         idea_ref = compact["idea_id"]
         source_type = "dict"
     else:
+        # Treat freeform strings as-is
         idea_json = idea.strip()
         idea_ref = f"raw-{uuid.uuid4().hex[:6]}"
         source_type = "string"
 
+    # Ensure token count is safe
     idea_json = truncate(idea_json, 3000)
-    user = SCRIPT_USER_TEMPLATE.format(
+
+    # Final user message assembly
+    user_message = SCRIPT_USER_TEMPLATE.format(
         dog_profile=dog_profile.strip(),
         idea_json=idea_json,
         schema_block=SCHEMA_BLOCK.strip()
     )
-    messages = [
-        SystemMessage(content=SCRIPT_SYSTEM),
-        HumanMessage(content=user)
-    ]
-    return messages, idea_ref + f"::{source_type}"
+    return [SystemMessage(content=SCRIPT_SYSTEM), HumanMessage(content=user_message)], f"{idea_ref}::{source_type}"
 
-# ========== JSON Validation & Repair ==========
-
+# ==================================================
+# JSON Validation and Repair Prompts
+# ==================================================
 REQUIRED_TOP_KEYS = {
     "idea_id","summary","hook","shots","audio_direction",
     "editing_notes","cta","caption","hashtags","effort_level",
@@ -196,14 +246,22 @@ REQUIRED_TOP_KEYS = {
 }
 
 def validate_script(script: Dict[str, Any]) -> List[str]:
+    """
+    Validate generated script structure.
+    Returns a list of warnings for any structural or semantic issues.
+    """
     warnings = []
+    # Required keys
     missing = REQUIRED_TOP_KEYS - set(script.keys())
     if missing:
         warnings.append(f"Missing keys: {sorted(missing)}")
-    # hook subkeys
+
+    # Hook must have spoken & on_screen
     hook = script.get("hook", {})
     if not isinstance(hook, dict) or any(k not in hook for k in ("spoken","on_screen")):
         warnings.append("hook must include spoken & on_screen")
+
+    # Shots (3–6, each with action & duration)
     shots = script.get("shots", [])
     if not isinstance(shots, list) or not shots:
         warnings.append("shots missing or empty")
@@ -215,21 +273,32 @@ def validate_script(script: Dict[str, Any]) -> List[str]:
                 warnings.append("shot missing action")
             if "duration_s" not in s:
                 warnings.append("shot missing duration_s")
+
+    # Hashtags (6–10)
     hashtags = script.get("hashtags", [])
     if not (6 <= len(hashtags) <= 10):
         warnings.append("hashtags count not 6–10")
+
+    # Rationale length
     rationale = script.get("rationale","")
     if len(rationale) > 180:
         warnings.append("rationale >180 chars")
+
+    # Effort level must be valid
     effort = script.get("effort_level","")
     if effort not in {"low","medium","high"}:
         warnings.append("effort_level invalid")
+
     return warnings
 
 def build_repair_prompt(original_raw: str, warnings: List[str]) -> List[Any]:
+    """
+    Build a prompt instructing the LLM to repair an invalid JSON output.
+    Provides the list of issues to fix and asks for a corrected single JSON object.
+    """
     repair_instructions = (
-        "The previous JSON did not meet validation. Fix ONLY the issues listed below; "
-        "return a SINGLE corrected JSON object, retaining good content, adjusting minimal necessary fields.\n"
+        "The previous JSON did not meet validation. Fix ONLY the issues below, "
+        "retain all good content, and return a SINGLE corrected JSON object.\n"
         f"Issues: {warnings}\n"
         "Return ONLY valid JSON. No commentary."
     )
@@ -239,60 +308,65 @@ def build_repair_prompt(original_raw: str, warnings: List[str]) -> List[Any]:
         HumanMessage(content=original_raw)
     ]
 
-# ========== Core Single Generation ==========
-
+# ==================================================
+# Core Generation for a Single Script
+# ==================================================
 def generate_single_script(
     idea: Union[str, Dict[str, Any]],
     dog_profile: str,
     repair_attempts: int = REPAIR_ATTEMPTS
 ) -> ScriptResult:
+    """
+    Generate a single script for a given idea and dog profile.
+    Handles:
+      - Initial LLM call (with retries).
+      - Basic JSON extraction.
+      - Validation warnings.
+      - Optional repair prompt if validation fails.
+    Returns a ScriptResult object with script JSON, metadata, and warnings.
+    """
     messages, idea_ref = build_script_prompt(idea, dog_profile)
     start = time.time()
     attempts = 0
-    raw_text = None
-    script_json = None
-    error = None
+    raw_text, script_json, error = None, None, None
     repaired = False
 
+    # Retry loop for generation
     for attempt in range(RETRY_ATTEMPTS):
         attempts = attempt + 1
         try:
             resp = llm.invoke(messages)
             raw_text = resp.content.strip()
-            # salvage JSON
-            if not raw_text.startswith("{"):
-                if "{" in raw_text and "}" in raw_text:
-                    first = raw_text.index("{")
-                    last = raw_text.rindex("}") + 1
-                    raw_text_candidate = raw_text[first:last]
-                    raw_text = raw_text_candidate
+
+            # Extract JSON portion (if extra text slipped through)
+            if not raw_text.startswith("{") and "{" in raw_text and "}" in raw_text:
+                raw_text = raw_text[raw_text.index("{"):raw_text.rindex("}")+1]
+
             script_json = json.loads(raw_text)
             if isinstance(script_json, dict):
                 script_json.setdefault("generated_at", iso_now())
                 break
             else:
-                error = "Top level JSON not object"
+                error = "Top-level JSON is not an object."
         except Exception as e:
             error = f"Gen attempt {attempt+1} error: {e}"
             if attempt < RETRY_ATTEMPTS - 1:
-                time.sleep(BASE_BACKOFF * (2 ** attempt))
+                time.sleep(BASE_BACKOFF * (2 ** attempt))  # Exponential backoff
             else:
                 break
 
-    warnings = []
-    if script_json:
-        warnings = validate_script(script_json)
+    # Validate the result (collect warnings)
+    warnings = validate_script(script_json or {})
 
-    # Attempt repair if needed
+    # Optional repair pass if warnings exist
     if warnings and repair_attempts > 0:
         repaired = True
         repair_msgs = build_repair_prompt(raw_text or "{}", warnings)
         try:
             resp = llm.invoke(repair_msgs)
             repaired_raw = resp.content.strip()
-            if not repaired_raw.startswith("{"):
-                if "{" in repaired_raw and "}" in repaired_raw:
-                    repaired_raw = repaired_raw[repaired_raw.index("{"):repaired_raw.rindex("}")+1]
+            if not repaired_raw.startswith("{") and "{" in repaired_raw and "}" in repaired_raw:
+                repaired_raw = repaired_raw[repaired_raw.index("{"):repaired_raw.rindex("}")+1]
             repaired_json = json.loads(repaired_raw)
             r_warnings = validate_script(repaired_json)
             if not r_warnings:
@@ -319,18 +393,33 @@ def generate_single_script(
         warnings=warnings
     )
 
-# ========== Parallel Generation ==========
-
+# ==================================================
+# Parallel Script Generation (Batch Mode)
+# ==================================================
 def generate_scripts_parallel(
     reel_ideas: Iterable[Union[str, Dict[str, Any]]],
     dog_profile: str,
     max_workers: int = MAX_WORKERS,
     progress_callback: Optional[Callable[[ScriptResult], None]] = None
 ) -> Dict[str, ScriptResult]:
+    """
+    Generate scripts for multiple ideas concurrently using a thread pool.
+    Each idea is passed to `generate_single_script`.
+
+    Args:
+        reel_ideas: List of ideas (str or dict).
+        dog_profile: Profile context for all ideas.
+        max_workers: Thread pool size.
+        progress_callback: Optional hook to receive ScriptResult as they complete.
+
+    Returns:
+        Dict mapping idea_ref → ScriptResult.
+    """
     reel_ideas = list(reel_ideas)
     results: Dict[str, ScriptResult] = {}
     if not reel_ideas:
         return results
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(generate_single_script, idea, dog_profile): idx
@@ -343,14 +432,26 @@ def generate_scripts_parallel(
                 progress_callback(res)
     return results
 
-# ========== Ranking Heuristics ==========
-
+# ==================================================
+# Script Scoring & Ranking (Heuristic-based)
+# ==================================================
 def _tokenize_hook(hook_text: str) -> List[str]:
+    """Tokenize hook text into normalized word tokens (for diversity checks)."""
     return re.findall(r"[a-zA-Z0-9']+", hook_text.lower())
 
 def compute_script_score(script: Dict[str, Any]) -> Tuple[float, Dict[str, float], List[str]]:
+    """
+    Compute a weighted score for a script based on:
+      - Shot quality (count, detail).
+      - Anticipation and pattern interrupts.
+      - Hook length and engagement features.
+      - Structure completeness and editing cues.
+    Returns:
+        Total score, component breakdown, and diagnostics.
+    """
     comps: Dict[str, float] = {}
     diagnostics: List[str] = []
+
     shots = script.get("shots", [])
     hashtags = script.get("hashtags", [])
     hook = safe_get(script, "hook.spoken", "") or ""
@@ -358,15 +459,12 @@ def compute_script_score(script: Dict[str, Any]) -> Tuple[float, Dict[str, float
     effort = script.get("effort_level","")
     rationale = script.get("rationale","")
 
-    # shot_count_score (ideal = 4 or 5)
+    # Shot count score (ideal ~4–5 shots)
     sc = len(shots)
-    if sc == 0:
-        comps["shot_count_score"] = 0
-    else:
-        ideal = 4.5
-        comps["shot_count_score"] = max(0, 1 - abs(sc - ideal)/ideal)  # in [0,1]
+    ideal = 4.5
+    comps["shot_count_score"] = max(0, 1 - abs(sc - ideal)/ideal) if sc else 0
 
-    # shot_detail_score (avg action length 25–90 chars sweet spot)
+    # Shot detail score (ideal action length 25–90 chars)
     if shots:
         avg_len = sum(len(s.get("action","")) for s in shots)/sc
         if avg_len < 15:
@@ -374,20 +472,20 @@ def compute_script_score(script: Dict[str, Any]) -> Tuple[float, Dict[str, float
         elif avg_len > 110:
             val = max(0, 1 - (avg_len - 110)/110)
         else:
-            val = min(1, (avg_len - 15)/(90))  # scale into region
+            val = min(1, (avg_len - 15)/90)
         comps["shot_detail_score"] = max(0, min(val, 1))
     else:
         comps["shot_detail_score"] = 0
 
-    # anticipation_score (look for patterns)
-    anticipation_terms = ("anticip", "suspens", "build", "tension", "payoff", "reveal")
+    # Anticipation cue score
+    anticip_terms = ("anticip", "suspens", "build", "tension", "payoff", "reveal")
     anticip_found = any(
-        any(term in (s.get("notes","")+s.get("action","")).lower() for term in anticipation_terms)
+        any(term in (s.get("notes","")+s.get("action","")).lower() for term in anticip_terms)
         for s in shots
     )
     comps["anticipation_score"] = 1.0 if anticip_found else 0.0
 
-    # pattern_interrupt_score (zoom, cut, broll, speed)
+    # Pattern interrupt score (zoom, b-roll, jump cuts)
     pi_terms = ("zoom","jump","speed","slow","b-roll","broll","cut","whip","flash")
     pi_found = any(
         any(term in (s.get("notes","")+s.get("action","")).lower() for term in pi_terms)
@@ -395,47 +493,40 @@ def compute_script_score(script: Dict[str, Any]) -> Tuple[float, Dict[str, float
     ) or bool(script.get("broll_inserts"))
     comps["pattern_interrupt_score"] = 1.0 if pi_found else 0.0
 
-    # hook_quality_score (<=12 words, presence of question/POV/surprise)
+    # Hook quality (length ≤12 words + engagement markers)
     hook_tokens = _tokenize_hook(hook)
-    if not hook_tokens:
-        comps["hook_quality_score"] = 0
-    else:
+    if hook_tokens:
         length_ok = len(hook_tokens) <= 12
         style_bonus = any(sym in hook.lower() for sym in ("?","!","pov","wait","did"))
         comps["hook_quality_score"] = (0.6 if length_ok else 0.3) + (0.4 if style_bonus else 0)
-
-    # effort_balance_score prefer low or medium
-    if effort == "low":
-        comps["effort_balance_score"] = 1.0
-    elif effort == "medium":
-        comps["effort_balance_score"] = 0.85
-    elif effort == "high":
-        comps["effort_balance_score"] = 0.55
     else:
-        comps["effort_balance_score"] = 0.3
+        comps["hook_quality_score"] = 0
 
-    # structure_completeness
+    # Effort balance (prefer low or medium)
+    comps["effort_balance_score"] = {"low":1.0,"medium":0.85,"high":0.55}.get(effort,0.3)
+
+    # Structure completeness (penalize missing keys)
     missing = REQUIRED_TOP_KEYS - set(script.keys())
     comps["structure_completeness"] = 1.0 if not missing else max(0, 1 - len(missing)/len(REQUIRED_TOP_KEYS))
 
-    # hashtag_span_score
+    # Hashtag span (count + diversity)
     hcount = len(hashtags)
-    if hcount == 0:
-        comps["hashtag_span_score"] = 0
-    else:
+    if hcount:
         base = 1.0 if 6 <= hcount <= 10 else max(0, 1 - abs(hcount - 8)/8)
         diversity = len({h.lower() for h in hashtags})/hcount
         comps["hashtag_span_score"] = base * diversity
+    else:
+        comps["hashtag_span_score"] = 0
 
-    # rationale_quality
+    # Rationale quality (length as proxy for thoughtfulness)
     comps["rationale_quality"] = min(1.0, len(rationale)/60) if rationale else 0.0
 
-    # edit_direction_score (look for edit cues)
+    # Editing direction cues (presence of edit terms)
     edit_terms = ("cut","zoom","speed","slow","fade","color","grade","transition","jump")
     edit_hits = sum(1 for t in edit_terms if t in editing_notes.lower())
     comps["edit_direction_score"] = min(1.0, edit_hits/3)
 
-    # Weighted sum
+    # Weighted sum (normalized to ~1)
     weights = {
         "shot_count_score": 0.10,
         "shot_detail_score": 0.15,
@@ -453,38 +544,44 @@ def compute_script_score(script: Dict[str, Any]) -> Tuple[float, Dict[str, float
     return total, comps, diagnostics
 
 def rank_scripts(results: Dict[str, ScriptResult]) -> List[Dict[str, Any]]:
-    # First pass scoring (without diversity bonus)
+    """
+    Score and rank all successfully generated scripts.
+    Adds a small diversity bonus based on uniqueness of hook tokens.
+    Returns a sorted leaderboard.
+    """
     scored = []
     hooks = []
+
+    # Compute scores per script
     for ref, res in results.items():
         if not res.script_json:
             continue
         score, comps, diag = compute_script_score(res.script_json)
-        res.score = score
-        res.score_components = comps
+        res.score, res.score_components = score, comps
         hooks.append((_tokenize_hook(safe_get(res.script_json,"hook.spoken","")), ref))
         scored.append(res)
 
-    # Diversity bonus across hooks: reward unique token sets
+    # Diversity bonus: reward unique hooks
     token_sets = {ref: set(tokens) for tokens, ref in hooks}
     uniqueness_scores = {}
     for ref, toks in token_sets.items():
-        overlap_counts = []
+        overlaps = []
         for other_ref, other_toks in token_sets.items():
-            if ref == other_ref: 
+            if ref == other_ref:
                 continue
             jacc = len(toks & other_toks)/max(1, len(toks | other_toks))
-            overlap_counts.append(jacc)
-        avg_overlap = sum(overlap_counts)/len(overlap_counts) if overlap_counts else 0
-        uniqueness_scores[ref] = max(0, 1 - avg_overlap)  # higher is better
+            overlaps.append(jacc)
+        avg_overlap = sum(overlaps)/len(overlaps) if overlaps else 0
+        uniqueness_scores[ref] = max(0, 1 - avg_overlap)
 
-    # Apply diversity bonus (up to +0.05)
+    # Apply diversity bonus (+0.05 max)
     for res in scored:
-        div_bonus = 0.05 * uniqueness_scores.get(res.idea_ref, 0)
-        res.score = (res.score or 0) + div_bonus
+        bonus = 0.05 * uniqueness_scores.get(res.idea_ref, 0)
+        res.score = (res.score or 0) + bonus
         if res.score_components:
-            res.score_components["diversity_bonus"] = div_bonus
+            res.score_components["diversity_bonus"] = bonus
 
+    # Build leaderboard rows
     ranked = sorted(scored, key=lambda r: r.score or 0, reverse=True)
     leaderboard = []
     for i, r in enumerate(ranked, start=1):
@@ -500,21 +597,27 @@ def rank_scripts(results: Dict[str, ScriptResult]) -> List[Dict[str, Any]]:
             print(f"[RANK {i}] {row}")
     return leaderboard
 
-# ========== Persistence & Display ==========
-
+# ==================================================
+# Persistence & Reporting
+# ==================================================
 def save_scripts(results: Dict[str, ScriptResult], out_dir: str = "data/scripts"):
+    """
+    Save each valid script JSON to the specified directory (filename = idea_ref.json).
+    """
     os.makedirs(out_dir, exist_ok=True)
     for ref, res in results.items():
         if res.script_json:
             fname = f"{ref.replace('::','_')}.json"
-            path = os.path.join(out_dir, fname)
-            with open(path, "w", encoding="utf-8") as f:
+            with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
                 json.dump(res.script_json, f, ensure_ascii=False, indent=2)
 
 def scripts_to_text(results: Dict[str, ScriptResult], ranked: List[Dict[str, Any]]) -> str:
-    lines = ["# Ranked Scripts\n"]
-    # leaderboard
-    lines.append("## Leaderboard")
+    """
+    Build a human-readable text report including:
+      - Leaderboard summary.
+      - Full JSON for each script (sorted by score).
+    """
+    lines = ["# Ranked Scripts\n", "## Leaderboard"]
     for row in ranked:
         lines.append(
             f"{row['rank']}. {row['idea_ref']} | score={row['score']} | "
@@ -532,26 +635,32 @@ def scripts_to_text(results: Dict[str, ScriptResult], ranked: List[Dict[str, Any
         lines.append("")
     return "\n".join(lines)
 
-# ========== Orchestrator Convenience ==========
-
+# ==================================================
+# Orchestration Convenience (Generate + Rank)
+# ==================================================
 def generate_and_rank(
     ideas: Iterable[Union[str, Dict[str, Any]]],
     dog_profile: str,
     save: bool = False,
     out_dir: str = "data/scripts"
 ) -> Tuple[Dict[str, ScriptResult], List[Dict[str, Any]]]:
+    """
+    Generate scripts for all ideas, rank them, and optionally save outputs.
+    Returns the raw results dict and leaderboard list.
+    """
     results = generate_scripts_parallel(ideas, dog_profile)
     leaderboard = rank_scripts(results)
     if save:
-        save_scripts(results, out_dir=out_dir)
-        # Save leaderboard
+        save_scripts(results, out_dir)
         with open(os.path.join(out_dir, "leaderboard.json"), "w", encoding="utf-8") as f:
             json.dump(leaderboard, f, ensure_ascii=False, indent=2)
     return results, leaderboard
 
-# ========== CLI Demo ==========
-
+# ==================================================
+# CLI Demo (Sample Execution)
+# ==================================================
 if __name__ == "__main__":
+    # Example ideas (mix of dict and string)
     sample_ideas: List[Union[str, Dict[str, Any]]] = [
         {
             "idea_id": "early-siren-detection",
@@ -584,5 +693,4 @@ if __name__ == "__main__":
     )
 
     results, leaderboard = generate_and_rank(sample_ideas, dog_profile, save=False)
-    text = scripts_to_text(results, leaderboard)
-    print(text)
+    print(scripts_to_text(results, leaderboard))
